@@ -1,0 +1,196 @@
+# -*- coding: utf-8 -*-
+"""
+Seasonal (Mar–Aug, 8 h/day) SERIES vs PARALLEL with MIFT.
+- Time-series plots shown separately for clarity
+- Length sweeps to meet an EWT cap for both topologies
+- Both 'equal branch flow' and 'equal total flow' comparisons
+
+Requires: pygfunction >= 2.3.x
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import calendar, datetime as dt
+import pygfunction as gt
+
+# ---------------- User choices ----------------
+TON          = 2.5                 # cooling tonnage
+EWT_CAP_C    = 33.0                # EWT design cap (change to 35.0 for the other policy)
+START_HOUR   = 10                  # ON start (10:00)
+HOURS_ON     = 8                   # ON duration per day
+MONTHS_ON    = range(3, 9)         # Mar..Aug inclusive
+YEARS        = 1                   # one seasonal year
+H_DEFAULT    = 50.0                # depth used in time-series comparison [m]
+H_GRID       = np.arange(30.0, 150.0+1e-9, 5.0)  # sweep grid [m]
+
+# Borefield layout
+N1, N2 = 4, 1                      # 4 bores in a row
+B      = 7.5                       # spacing [m]
+D      = 4.0                       # burial depth [m]
+r_b    = 0.1532/2                  # bore radius [m]
+
+# Ground / materials
+T_g, k_s, alpha = 25.0, 2.45, 1.0e-6
+k_g, k_p = 2.98, 0.70
+
+# Pipe / fluid
+r_out, r_in = 33.6e-3/2, 27.4e-3/2
+D_s = 0.11/2
+epsilon = 1e-6
+pos = [(-D_s, 0.0), (D_s, 0.0)]
+m_flow_bore_base = 0.30            # branch mass flow per bore, base case
+fluid = gt.media.Fluid('Water', 30.0)
+cp_f, rho_f, mu_f, k_f = fluid.cp, fluid.rho, fluid.mu, fluid.k
+
+# Time grid (hourly)
+dt_sec = 3600.0
+year0  = 2025
+
+# g-function options (pygfunction >= 2.3)
+OPTS_SERIES   = {'nSegments': 8, 'disp': False}
+OPTS_PARALLEL = {'nSegments': 8, 'disp': False}
+
+# ---------------- Helpers ----------------
+def build_year_schedule(year, months_on, start_hour, on_hours, Q_on):
+    hours = (366 if calendar.isleap(year) else 365) * 24
+    Q = np.zeros(hours)
+    t0 = dt.datetime(year, 1, 1)
+    for m in months_on:
+        days = calendar.monthrange(year, m)[1]
+        for d in range(1, days+1):
+            for h in range(start_hour, start_hour+on_hours):
+                hh = h % 24
+                idx = int((dt.datetime(year, m, d, hh) - t0).total_seconds() // 3600)
+                Q[idx] = Q_on
+    return Q
+
+def pipe_resistance(m_flow_branch):
+    R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+    h_f = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+        m_flow_branch, r_in, mu_f, rho_f, k_f, cp_f, epsilon
+    )
+    R_f = 1.0/(h_f*2*np.pi*r_in)
+    return R_p + R_f
+
+def make_network(H, topology, m_flow_branch):
+    """Return (network, m_flow_network, H_tot)."""
+    borefield = gt.boreholes.rectangle_field(N1, N2, B, B, H, D, r_b)
+    nB = len(borefield)
+    Rtube = pipe_resistance(m_flow_branch)
+    UTubes = [gt.pipes.SingleUTube(pos, r_in, r_out, bh, k_s, k_g, Rtube) for bh in borefield]
+    if topology == 'series':
+        conn = [i-1 for i in range(nB)]           # flow through all bores
+        m_flow_network = m_flow_branch           # same branch flow flows through network
+    elif topology == 'parallel':
+        conn = [-1]*nB                            # each bore is a branch
+        m_flow_network = m_flow_branch * nB       # sum of branch flows
+    else:
+        raise ValueError("topology must be 'series' or 'parallel'")
+    return gt.networks.Network(borefield, UTubes, bore_connectivity=conn), m_flow_network, sum(b.H for b in borefield)
+
+def simulate(topology, H, Q_series, m_flow_branch, equal_total=False):
+    """MIFT network simulation. If equal_total=True, keep m_flow_network constant across topologies."""
+    net, m_flow_net, H_tot = make_network(H, topology, m_flow_branch)
+    Nt = len(Q_series)
+    time = dt_sec*(np.arange(Nt)+1)
+    LoadAgg = gt.load_aggregation.ClaessonJaved(dt_sec, time[-1])
+    # Choose fast/valid solver per topology
+    method = 'similarities' if topology=='series' else 'equivalent'
+    gFunc = gt.gfunction.gFunction(net, alpha,
+                                   time=LoadAgg.get_times_for_simulation(),
+                                   m_flow_network=m_flow_net, cp_f=cp_f,
+                                   boundary_condition='MIFT',
+                                   options=(OPTS_SERIES if topology=='series' else OPTS_PARALLEL),
+                                   method=method)
+    LoadAgg.initialize(gFunc.gFunc/(2*np.pi*k_s))
+    T_b = np.zeros(Nt); T_in = np.zeros(Nt); T_out = np.zeros(Nt)
+    for i, (t, Q) in enumerate(zip(time, Q_series)):
+        LoadAgg.next_time_step(t)
+        LoadAgg.set_current_load(Q / H_tot)
+        dT = LoadAgg.temporal_superposition()
+        T_b[i] = T_g - dT
+        T_in[i]  = net.get_network_inlet_temperature(Q, T_b[i], m_flow_net, cp_f, nSegments=3)
+        T_out[i] = net.get_network_outlet_temperature(T_in[i], T_b[i], m_flow_net, cp_f, nSegments=3)
+    return time, T_b, T_in, T_out
+
+def sweep_peak_ewt(topology, H_grid, Q_series, m_flow_branch):
+    peaks = []
+    for H in H_grid:
+        _, _, _, Tout = simulate(topology, H, Q_series, m_flow_branch)
+        peaks.append(np.max(Tout))
+    return np.array(peaks)
+
+# ---------------- Build seasonal schedule ----------------
+Q_on = -1000.0 * 3.517 * TON     # W, cooling → inject (negative)
+Q_year = build_year_schedule(2025, MONTHS_ON, START_HOUR, HOURS_ON, Q_on)
+Q_series = np.tile(Q_year, YEARS)
+print(f"[Schedule] ON hours/year = {np.count_nonzero(Q_year)} h (Mar–Aug, {HOURS_ON} h/day)")
+
+# ---------------- 1) Separate time-series plots ----------------
+# Equal branch flow (0.30 kg/s per bore) for both
+tS, TbS, TinS, ToutS = simulate('series',   H_DEFAULT, Q_series, m_flow_bore_base)
+tP, TbP, TinP, ToutP = simulate('parallel', H_DEFAULT, Q_series, m_flow_bore_base)
+
+# Plot SERIES only
+sl = slice(np.argmax(Q_year!=0), len(Q_year)-np.argmax(Q_year[::-1]!=0))
+hrs = np.arange(sl.start, sl.stop) - sl.start
+plt.figure(figsize=(9,5))
+plt.plot(hrs, ToutS[sl], label="EWT to unit (series)")
+plt.plot(hrs, TinS[sl],  label="LWT to ground (series)")
+plt.plot(hrs, TbS[sl],   label="Borehole wall T_b (series)")
+plt.axhline(EWT_CAP_C, ls='--', lw=1, label=f"EWT cap {EWT_CAP_C:.0f} °C")
+plt.xlabel("Hours since season start"); plt.ylabel("Temperature [°C]")
+plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+
+# Plot PARALLEL only
+plt.figure(figsize=(9,5))
+plt.plot(hrs, ToutP[sl], label="EWT to unit (parallel)")
+plt.plot(hrs, TinP[sl],  label="LWT to ground (parallel)")
+plt.plot(hrs, TbP[sl],   label="Borehole wall T_b (parallel)")
+plt.axhline(EWT_CAP_C, ls='--', lw=1, label=f"EWT cap {EWT_CAP_C:.0f} °C")
+plt.xlabel("Hours since season start"); plt.ylabel("Temperature [°C]")
+plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+
+print(f"Series @ H={H_DEFAULT:.0f} m:   peak EWT={np.max(ToutS):.2f} °C, peak LWT={np.max(TinS):.2f} °C, peak T_b={np.max(TbS):.2f} °C")
+print(f"Parallel @ H={H_DEFAULT:.0f} m: peak EWT={np.max(ToutP):.2f} °C, peak LWT={np.max(TinP):.2f} °C, peak T_b={np.max(TbP):.2f} °C")
+
+# ---------------- 2) Length sweeps (equal branch flow) ----------------
+pe_series_eqBranch   = sweep_peak_ewt('series',   H_GRID, Q_series, m_flow_bore_base)
+pe_parallel_eqBranch = sweep_peak_ewt('parallel', H_GRID, Q_series, m_flow_bore_base)
+Hmin_series   = H_GRID[np.argmax(pe_series_eqBranch   <= EWT_CAP_C)] if np.any(pe_series_eqBranch<=EWT_CAP_C) else None
+Hmin_parallel = H_GRID[np.argmax(pe_parallel_eqBranch <= EWT_CAP_C)] if np.any(pe_parallel_eqBranch<=EWT_CAP_C) else None
+
+plt.figure(figsize=(9,5))
+plt.plot(H_GRID, pe_series_eqBranch,   marker='o', label="Peak EWT (series) — equal branch flow")
+plt.plot(H_GRID, pe_parallel_eqBranch, marker='s', label="Peak EWT (parallel) — equal branch flow")
+plt.axhline(EWT_CAP_C, ls='--', lw=1, label=f"EWT cap {EWT_CAP_C:.0f} °C")
+if Hmin_series is not None:
+    plt.axvline(Hmin_series, ls=':', lw=1, label=f"Min H series ≈ {Hmin_series:.1f} m")
+if Hmin_parallel is not None:
+    plt.axvline(Hmin_parallel, ls=':', lw=1, label=f"Min H parallel ≈ {Hmin_parallel:.1f} m")
+plt.xlabel("Borehole depth per bore [m]"); plt.ylabel("Seasonal peak EWT [°C]")
+plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+
+print(f"[Equal branch flow] Min H — series: {Hmin_series}, parallel: {Hmin_parallel}")
+
+# ---------------- 3) Length sweeps (equal TOTAL flow) ----------------
+# Fix total network flow equal to 4×0.30 = 1.20 kg/s in BOTH cases.
+# => series branch flow = 1.20; parallel branch flow = 1.20/4 = 0.30 (same as base)
+pe_series_eqTotal   = sweep_peak_ewt('series',   H_GRID, Q_series, m_flow_branch=4*m_flow_bore_base)
+pe_parallel_eqTotal = sweep_peak_ewt('parallel', H_GRID, Q_series, m_flow_branch=0.25*4*m_flow_bore_base)  # = 0.30
+
+Hmin_series_T   = H_GRID[np.argmax(pe_series_eqTotal   <= EWT_CAP_C)] if np.any(pe_series_eqTotal<=EWT_CAP_C) else None
+Hmin_parallel_T = H_GRID[np.argmax(pe_parallel_eqTotal <= EWT_CAP_C)] if np.any(pe_parallel_eqTotal<=EWT_CAP_C) else None
+
+plt.figure(figsize=(9,5))
+plt.plot(H_GRID, pe_series_eqTotal,   marker='o', label="Peak EWT (series) — equal total flow")
+plt.plot(H_GRID, pe_parallel_eqTotal, marker='s', label="Peak EWT (parallel) — equal total flow")
+plt.axhline(EWT_CAP_C, ls='--', lw=1, label=f"EWT cap {EWT_CAP_C:.0f} °C")
+if Hmin_series_T is not None:
+    plt.axvline(Hmin_series_T, ls=':', lw=1, label=f"Min H series ≈ {Hmin_series_T:.1f} m")
+if Hmin_parallel_T is not None:
+    plt.axvline(Hmin_parallel_T, ls=':', lw=1, label=f"Min H parallel ≈ {Hmin_parallel_T:.1f} m")
+plt.xlabel("Borehole depth per bore [m]"); plt.ylabel("Seasonal peak EWT [°C]")
+plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+
+print(f"[Equal TOTAL flow] Min H — series: {Hmin_series_T}, parallel: {Hmin_parallel_T}")
