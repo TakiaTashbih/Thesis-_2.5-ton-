@@ -1,0 +1,314 @@
+# Pareto sizing: thermal (EWT cap) + pump power for 4-bore SERIES vs PARALLEL
+# Requires: pygfunction >= 2.3.x
+
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import datetime as dt, calendar
+import math
+import pygfunction as gt
+
+# -----------------------------
+# Plot: Times New Roman / 12 pt
+# -----------------------------
+mpl.rcParams.update({
+    "font.family": "Times New Roman",
+    "font.size": 12,
+    "axes.titlesize": 12,
+    "axes.labelsize": 12,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 12,
+    "mathtext.fontset": "stix",
+})
+
+# -----------------------------
+# USER INPUTS
+# -----------------------------
+TON = 2.5                     # cooling tonnage
+EWT_CAP_C = 33.0              # EWT cap (°C); try 35 as a sensitivity
+START_HOUR = 10               # daily ON start (10:00)
+HOURS_ON = 8                  # ON duration per day
+MONTHS_ON = range(3, 9)       # Mar..Aug inclusive
+YEARS = 1                     # one seasonal year
+YEAR0 = 2025                  # calendar base (non-leap ok)
+
+# Borefield layout (same for both topologies)
+N_1, N_2 = 4, 1               # 4 bores in a row
+N_BORES  = N_1 * N_2
+B = 7.5                        # spacing [m]
+D = 4.0                        # burial depth [m] (head)
+H_DEFAULT = 50.0               # depth used for the example time-series [m]
+r_b = 0.1532 / 2               # bore radius [m]
+
+# Ground / materials (Bangladesh-like)
+T_g = 25.0                     # undisturbed ground [°C]
+k_s = 2.45                     # ground conductivity [W/m.K]
+alpha = 1.0e-6                 # diffusivity [m^2/s]
+k_g = 2.98                     # grout [W/m.K]
+k_p = 0.70                     # pipe [W/m.K]
+
+# Pipe / fluid
+r_out = 33.6e-3 / 2
+r_in  = 27.4e-3 / 2
+D_s   = 0.11 / 2               # legs at ±D_s → spacing ≈ 0.11 m
+epsilon = 1e-6                 # roughness [m]
+pos_pipes = [(-D_s, 0.0), (D_s, 0.0)]   # single U per bore
+m_flow_bore = 0.30             # kg/s per bore (branch flow target)
+fluid = gt.media.Fluid('Water', 30.0)   # ~summer water temp
+cp_f, rho_f, mu_f, k_f = fluid.cp, fluid.rho, fluid.mu, fluid.k
+
+# Load magnitude (cooling → inject to ground)
+Q_ON = -1000.0 * 3.517 * TON   # W (negative = heat to ground)
+
+# Time grid (hourly)
+dt_sec = 3600.0
+
+# g-function options
+OPT_SERIES   = {'nSegments': 8, 'disp': False}
+OPT_PARALLEL = {'nSegments': 8, 'disp': False}
+METHOD_SERIES   = 'similarities'
+METHOD_PARALLEL = 'equivalent'  # faster for parallel networks
+
+# -----------------------------
+# Pump hydraulics (Darcy–Weisbach)
+# -----------------------------
+g = 9.80665  # m/s^2
+
+# Pipe diameters (inner) and lengths — EDIT to your layout
+D_leg = 0.0274          # U-tube leg ID [m]
+D_hdr = 0.050           # header ID [m] (set by your manifold)
+L_hdr_supply  = (N_BORES - 1)*B + 10.0   # [m] main supply header
+L_hdr_return  = (N_BORES - 1)*B + 10.0   # [m] main return header
+L_branch_conn = 5.0                      # [m] lateral per branch (each side)
+
+# Minor losses — placeholders; replace with manufacturer/handbook values if available
+K_ubend       = 1.5     # 180° U-bend
+K_per_elbow   = 0.30    # long-radius 90°
+n_elbows_branch = 2     # elbows near head per branch
+K_tee_branch  = 1.0     # tee branch loss (each connection)
+K_tee_run     = 0.20    # tee run loss (supply + return use ×2N)
+pump_efficiency = 0.60  # wire-to-water
+
+def area(D): return math.pi*(D**2)/4.0
+def velocity(m_dot, rho, D): return m_dot/(rho*area(D))
+def reynolds(rho, v, D, mu): return rho*v*D/mu
+def friction_factor(Re, D, eps):
+    if Re < 2000: return 64.0/max(Re,1e-9)
+    term = (eps/D)/3.7
+    return 1.0/(-1.8*math.log10((term**1.11)+(6.9/Re)))**2
+def dp_fric(rho, v, L, D, f): return f*(L/D)*0.5*rho*v**2
+def dp_minor(rho, v, K): return K*0.5*rho*v**2
+def head_from_dp(dp, rho): return dp/(rho*g)
+def pump_power(Q_vol, dp, eta): return (Q_vol*dp)/max(eta,1e-9)
+
+def hydraulics_series(H, m_branch):
+    m_total = m_branch                        # series: same flow everywhere
+    Q_total = m_total / rho
+    # Legs (2H per bore × N)
+    v_leg  = velocity(m_total, rho, D_leg)
+    Re_leg = reynolds(rho, v_leg, D_leg, mu)
+    f_leg  = friction_factor(Re_leg, D_leg, epsilon)
+    dp_legs = dp_fric(rho, v_leg, 2*H*N_BORES, D_leg, f_leg)
+    # U-bends + elbows
+    dp_ub   = dp_minor(rho, v_leg, K_ubend*N_BORES)
+    dp_el   = dp_minor(rho, v_leg, n_elbows_branch*N_BORES*K_per_elbow)
+    # Headers (full flow)
+    v_hdr  = velocity(m_total, rho, D_hdr)
+    Re_hdr = reynolds(rho, v_hdr, D_hdr, mu)
+    f_hdr  = friction_factor(Re_hdr, D_hdr, epsilon)
+    dp_hdr = dp_fric(rho, v_hdr, L_hdr_supply+L_hdr_return, D_hdr, f_hdr)
+    dp_tot = dp_legs + dp_ub + dp_el + dp_hdr
+    return dp_tot, head_from_dp(dp_tot, rho), pump_power(Q_total, dp_tot, pump_efficiency)
+
+def hydraulics_parallel(H, m_branch):
+    m_total = m_branch * N_BORES
+    Q_total = m_total / rho
+    # Per-branch legs
+    v_leg_b  = velocity(m_branch, rho, D_leg)
+    Re_leg_b = reynolds(rho, v_leg_b, D_leg, mu)
+    f_leg_b  = friction_factor(Re_leg_b, D_leg, epsilon)
+    dp_legs_b = dp_fric(rho, v_leg_b, 2*H, D_leg, f_leg_b)
+    # Branch minors: U-bend + elbows + tee branch
+    dp_minor_b = dp_minor(rho, v_leg_b, K_ubend + n_elbows_branch*K_per_elbow + K_tee_branch)
+    # Branch laterals (supply+return)
+    v_lat_b  = velocity(m_branch, rho, D_hdr)
+    Re_lat_b = reynolds(rho, v_lat_b, D_hdr, mu)
+    f_lat_b  = friction_factor(Re_lat_b, D_hdr, epsilon)
+    dp_lat_b = dp_fric(rho, v_lat_b, 2*L_branch_conn, D_hdr, f_lat_b)
+    dp_branch = dp_legs_b + dp_minor_b + dp_lat_b
+    # Headers (avg flow ≈ 0.5*m_total) + tee run minors
+    m_hdr_avg = 0.5 * m_total
+    v_hdr  = velocity(m_hdr_avg, rho, D_hdr)
+    Re_hdr = reynolds(rho, v_hdr, D_hdr, mu)
+    f_hdr  = friction_factor(Re_hdr, D_hdr, epsilon)
+    dp_hdr = dp_fric(rho, v_hdr, L_hdr_supply+L_hdr_return, D_hdr, f_hdr)
+    dp_hdr_minor = dp_minor(rho, v_hdr, 2*N_BORES*K_tee_run)
+    dp_tot = dp_branch + dp_hdr + dp_hdr_minor
+    return dp_tot, head_from_dp(dp_tot, rho), pump_power(Q_total, dp_tot, pump_efficiency)
+
+# -----------------------------
+# Seasonal load builder
+# -----------------------------
+def build_year_schedule(year, months_on, start_hour, on_hours):
+    hours = (366 if calendar.isleap(year) else 365)*24
+    Q = np.zeros(hours)
+    t0 = dt.datetime(year, 1, 1)
+    for m in months_on:
+        days = calendar.monthrange(year, m)[1]
+        for d in range(1, days+1):
+            for h in range(start_hour, start_hour+on_hours):
+                hh = h % 24
+                idx = int(((dt.datetime(year, m, d, hh) - t0).total_seconds())//3600)
+                Q[idx] = Q_ON
+    return Q
+
+Q_year = build_year_schedule(YEAR0, MONTHS_ON, START_HOUR, HOURS_ON)
+Q_series = np.tile(Q_year, YEARS)
+Nt = len(Q_series)
+time = dt_sec * (np.arange(Nt) + 1)
+print(f"[Schedule] ON hours/year = {np.count_nonzero(Q_year)} ; Mar–Aug, {HOURS_ON} h/day")
+
+# -----------------------------
+# Borefield + networks + thermal sim
+# -----------------------------
+def make_borefield(H):
+    return gt.boreholes.rectangle_field(N_1, N_2, B, B, H, D, r_b)
+
+def make_network(borefield, topology):
+    # Pipe-side resistance (per bore)
+    R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+    h_f = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+        m_flow_bore, r_in, mu_f, rho_f, k_f, cp_f, epsilon
+    )
+    R_f = 1.0 / (h_f * 2*np.pi*r_in)
+    UTubes = [gt.pipes.SingleUTube(pos_pipes, r_in, r_out, bh, k_s, k_g, R_f+R_p) for bh in borefield]
+    if topology == 'series':
+        conn = [i-1 for i in range(len(borefield))]
+        m_flow_net = m_flow_bore
+        opts, method = OPT_SERIES, METHOD_SERIES
+    else:
+        conn = [-1]*len(borefield)
+        m_flow_net = m_flow_bore * len(borefield)
+        opts, method = OPT_PARALLEL, METHOD_PARALLEL
+    net = gt.networks.Network(borefield, UTubes, bore_connectivity=conn)
+    return net, m_flow_net, sum(b.H for b in borefield), opts, method
+
+def simulate(topology, H, Q_series):
+    borefield = make_borefield(H)
+    network, m_flow_net, H_tot, gopts, method = make_network(borefield, topology)
+    LoadAgg = gt.load_aggregation.ClaessonJaved(dt_sec, time[-1])
+    gFunc = gt.gfunction.gFunction(
+        network, alpha,
+        time=LoadAgg.get_times_for_simulation(),
+        m_flow_network=m_flow_net, cp_f=cp_f,
+        boundary_condition='MIFT',
+        options=gopts, method=method
+    )
+    LoadAgg.initialize(gFunc.gFunc/(2*np.pi*k_s))
+    T_b = np.zeros(Nt); T_in = np.zeros(Nt); T_out = np.zeros(Nt)
+    for i, (t, Q) in enumerate(zip(time, Q_series)):
+        LoadAgg.next_time_step(t)
+        LoadAgg.set_current_load(Q / H_tot)
+        dT_b = LoadAgg.temporal_superposition()
+        T_b[i] = T_g - dT_b
+        T_in[i]  = network.get_network_inlet_temperature(Q,   T_b[i], m_flow_net, cp_f, nSegments=3)
+        T_out[i] = network.get_network_outlet_temperature(T_in[i], T_b[i], m_flow_net, cp_f, nSegments=3)
+    return T_b, T_in, T_out
+
+def peak_ewt(topology, H):
+    _, _, T_out = simulate(topology, H, Q_series)
+    return float(np.max(T_out))
+
+# -----------------------------
+# 1) Separate seasonal traces at H_DEFAULT
+# -----------------------------
+Tb_s, Tin_s, Tout_s = simulate('series',   H_DEFAULT, Q_series)
+Tb_p, Tin_p, Tout_p = simulate('parallel', H_DEFAULT, Q_series)
+
+# find seasonal slice (first non-zero to last non-zero in first year)
+first_on = np.argmax(Q_year != 0)
+last_on  = len(Q_year) - 1 - np.argmax(Q_year[::-1] != 0)
+sl = slice(first_on, last_on+1)
+hrs = (np.arange(sl.start, sl.stop) - sl.start)
+
+fig1, (ax1, ax2) = plt.subplots(2,1, figsize=(10,7), sharex=True)
+ax1.plot(hrs, Tout_s[sl], label="EWT")
+ax1.plot(hrs, Tb_s[sl],  '--', label="Borehole wall")
+ax1.axhline(EWT_CAP_C, color='k', lw=1, ls='--', label=f"EWT cap {EWT_CAP_C:.0f} °C")
+ax1.set_title(f"Series, H = {H_DEFAULT:.0f} m per bore")
+ax1.set_ylabel("Temperature [°C]"); ax1.legend(); ax1.grid(True)
+
+ax2.plot(hrs, Tout_p[sl], label="EWT")
+ax2.plot(hrs, Tb_p[sl],  '--', label="Borehole wall")
+ax2.axhline(EWT_CAP_C, color='k', lw=1, ls='--', label=f"EWT cap {EWT_CAP_C:.0f} °C")
+ax2.set_title(f"Parallel, H = {H_DEFAULT:.0f} m per bore")
+ax2.set_xlabel("Time since season start [h]"); ax2.set_ylabel("Temperature [°C]")
+ax2.legend(); ax2.grid(True)
+plt.tight_layout(); plt.show()
+
+print(f"Series@{H_DEFAULT:.0f} m:   peak EWT={np.max(Tout_s):.2f} °C, peak T_b={np.max(Tb_s):.2f} °C")
+print(f"Parallel@{H_DEFAULT:.0f} m: peak EWT={np.max(Tout_p):.2f} °C, peak T_b={np.max(Tb_p):.2f} °C")
+
+# -----------------------------
+# 2) Length sweep: Peak EWT vs depth + Pump power vs depth
+# -----------------------------
+H_grid = np.arange(30.0, 150.0+1e-9, 5.0)
+
+# Thermal sweep
+peaks_series   = np.array([peak_ewt('series',   H) for H in H_grid])
+peaks_parallel = np.array([peak_ewt('parallel', H) for H in H_grid])
+
+# Find min depth meeting cap
+def min_depth_meeting_cap(peaks, H_grid, cap):
+    feasible = peaks <= cap + 1e-9
+    return (H_grid[feasible][0] if np.any(feasible) else None)
+
+Hmin_series   = min_depth_meeting_cap(peaks_series,   H_grid, EWT_CAP_C)
+Hmin_parallel = min_depth_meeting_cap(peaks_parallel, H_grid, EWT_CAP_C)
+
+# Pump sweep (depends on H via vertical leg length)
+dpS, headS, PS = [], [], []
+dpP, headP, PP = [], [], []
+for H in H_grid:
+    dp_s, h_s, p_s = hydraulics_series(H, m_flow_bore)
+    dp_p, h_p, p_p = hydraulics_parallel(H, m_flow_bore)
+    dpS.append(dp_s); headS.append(h_s); PS.append(p_s)
+    dpP.append(dp_p); headP.append(h_p); PP.append(p_p)
+PS = np.array(PS); PP = np.array(PP)
+
+# Plots: Peak EWT vs depth
+fig2, ax = plt.subplots(figsize=(9,5))
+ax.plot(H_grid, peaks_series,   '-o', label="Series")
+ax.plot(H_grid, peaks_parallel, '-o', label="Parallel")
+ax.axhline(EWT_CAP_C, color='k', lw=1, ls='--', label=f"EWT cap {EWT_CAP_C:.0f} °C")
+if Hmin_series is not None:
+    ax.axvline(Hmin_series, color='C0', ls=':', lw=1, label=f"Series min ≈ {Hmin_series:.1f} m")
+if Hmin_parallel is not None:
+    ax.axvline(Hmin_parallel, color='C1', ls=':', lw=1, label=f"Parallel min ≈ {Hmin_parallel:.1f} m")
+ax.set_xlabel("Borehole depth per bore [m]"); ax.set_ylabel("Seasonal peak EWT [°C]")
+ax.grid(True); ax.legend(); plt.tight_layout(); plt.show()
+
+# Plots: Pump power vs depth
+fig3, ax3 = plt.subplots(figsize=(9,5))
+ax3.plot(H_grid, PS/1000.0, '-o', label="Series pump power")
+ax3.plot(H_grid, PP/1000.0, '-o', label="Parallel pump power")
+if Hmin_series is not None:
+    ax3.axvline(Hmin_series, color='C0', ls=':', lw=1)
+if Hmin_parallel is not None:
+    ax3.axvline(Hmin_parallel, color='C1', ls=':', lw=1)
+ax3.set_xlabel("Borehole depth per bore [m]"); ax3.set_ylabel("Pump power [kW]")
+ax3.grid(True); ax3.legend(); plt.tight_layout(); plt.show()
+
+# Print concise results at the cap
+def report_at(Hmin, label):
+    if Hmin is None:
+        print(f"{label}: No depth ≤ {H_grid[-1]:.0f} m met EWT cap {EWT_CAP_C:.0f} °C.")
+        return
+    # nearest index
+    i = int(np.argmin(np.abs(H_grid - Hmin)))
+    P_arr = PS if label=="Series" else PP
+    print(f"{label}: H* ≈ {Hmin:.1f} m → Pump ≈ {P_arr[i]/1000.0:.2f} kW")
+
+report_at(Hmin_series, "Series")
+report_at(Hmin_parallel, "Parallel")
