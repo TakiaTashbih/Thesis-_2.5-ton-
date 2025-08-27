@@ -1,0 +1,171 @@
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import numpy as np
+import pygfunction as gt
+import pandas as pd
+mpl.rcParams['font.family'] = 'Times New Roman'
+mpl.rcParams['font.size'] = 12
+
+def main():
+    # -------------------------
+    # Ground properties
+    # -------------------------
+    T_g   = 25.0       # undisturbed ground temp [°C]
+    k_s   = 2.45        # ground conductivity [W/m.K]
+    alpha = 1.0e-6     # thermal diffusivity [m2/s]
+
+    # -------------------------
+    # Borehole dimensions
+    # -------------------------
+    D = 4.0        # Borehole buried depth (m)
+    H = 50.0      # Borehole length (m)
+    r_b = 0.1532/2    # Borehole radius (m)
+
+    # -------------------------
+    # Bore field geometry
+    # -------------------------
+    N_1 = 4       # Number of boreholes in x-direction
+    N_2 = 1        # Number of boreholes in y-direction
+    B = 6        # Borehole spacing (m)
+
+    # -------------------------
+    # Pipe dimensions
+    # -------------------------
+    r_out = 33.6e-3 / 2   # Pipe outer radius (m)
+    r_in  = 27.4e-3 / 2   # Pipe inner radius (m)
+    D_s   = 0.11 / 2      # Shank spacing (m)
+    epsilon = 1.0e-6      # Pipe roughness (m)
+
+    pos_pipes = [(-D_s, 0.0), (D_s, 0.0)]  # U-tube
+
+    # -------------------------
+    # Material properties
+    # -------------------------
+    k_g = 2.98       # grout conductivity (W/m.K)
+    k_p = 0.7      # pipe conductivity (W/m.K)
+
+    # -------------------------
+    # Fluid properties
+    # -------------------------
+    m_flow_borehole = 0.3   # [kg/s] per borehole
+    fluid = gt.media.Fluid('Water', 30.)  # assume water at 20 °C
+    cp_f, rho_f, mu_f, k_f = fluid.cp, fluid.rho, fluid.mu, fluid.k
+
+    # -------------------------
+    # Simulation parameters
+    # -------------------------
+    dt   = 3600.0          # 1 hr
+    tmax = 30*24 * 3600.0     # simulate 30 days
+    Nt   = int(np.ceil(tmax / dt))
+    time = dt * np.arange(1, Nt+1)
+    hours = time/3600
+
+    # -------------------------
+    # Load aggregation
+    # -------------------------
+    LoadAgg = gt.load_aggregation.ClaessonJaved(dt, tmax)
+
+    # -------------------------
+    # Borefield setup
+    # -------------------------
+    borefield = gt.boreholes.rectangle_field(N_1, N_2, B, B, H, D, r_b)
+    nBoreholes = len(borefield)
+    H_tot = np.sum([b.H for b in borefield])
+    bore_connectivity = [i-1 for i in range(nBoreholes)]  # series connection
+
+    # -------------------------
+    # Pipe resistances
+    # -------------------------
+    R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+    h_f = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+        m_flow_borehole, r_in, mu_f, rho_f, k_f, cp_f, epsilon
+    )
+    R_f = 1.0 / (h_f * 2*np.pi*r_in)
+
+    # Build U-tubes
+    UTubes = []
+    for borehole in borefield:
+        UTubes.append(
+            gt.pipes.SingleUTube(pos_pipes, r_in, r_out, borehole, k_s, k_g, R_f + R_p)
+        )
+
+    # Network (series boreholes)
+    network = gt.networks.Network(borefield, UTubes, bore_connectivity=bore_connectivity)
+
+    # -------------------------
+    # g-function
+    # -------------------------
+    time_req = LoadAgg.get_times_for_simulation()
+    m_flow_network = m_flow_borehole 
+    gFunc = gt.gfunction.gFunction(
+        network, alpha, time=time_req, m_flow_network=m_flow_network,
+        cp_f=cp_f, boundary_condition='MIFT',
+        options={'nSegments': 8, 'disp': True},method='similarities'
+    )
+    LoadAgg.initialize(gFunc.gFunc / (2*np.pi*k_s))
+
+    # -------------------------
+    # Cooling load (2.5 ton = ~11.3 kW)
+    # -------------------------
+    Q_reject_W =-3.517*1000*2.50   # heat injected into ground
+    Q_tot = np.full(Nt, Q_reject_W)
+
+    # -------------------------
+    # Time marching
+    # -------------------------
+    T_b     = np.zeros(Nt)
+    T_f_in  = np.zeros(Nt)
+    T_f_out = np.zeros(Nt)
+
+    for i, (t, Q) in enumerate(zip(time, Q_tot)):
+        LoadAgg.next_time_step(t)
+
+        Q_b = Q / H_tot  # W/m
+        LoadAgg.set_current_load(Q_b)
+
+        dT_b = LoadAgg.temporal_superposition()
+        T_b[i] = T_g - dT_b
+
+        T_f_in[i] = network.get_network_inlet_temperature(
+            Q, T_b[i], m_flow_network, cp_f, nSegments=3
+        )
+        T_f_out[i] = network.get_network_outlet_temperature(
+            T_f_in[i], T_b[i], m_flow_network, cp_f, nSegments=3
+        )
+
+    # -------------------------
+    # Plots
+    # -------------------------
+    fig, ax = plt.subplots(2,1, figsize=(10,8))
+    ax[0].plot(hours, Q_tot/1000)
+    ax[0].set_xlabel("Time [h]")
+    ax[0].set_ylabel("Heat Rejection [kW]")
+    ax[0].grid(True)
+
+    ax[1].plot(hours, T_b, label="Borehole wall")
+    ax[1].plot(hours, T_f_in, '-.', label="let fluid")
+    ax[1].plot(hours, T_f_out, '-.', label="Outlet fluid")
+    ax[1].set_xlabel("Time [h]")
+    ax[1].set_ylabel("Temperature [°C]")
+    ax[1].legend()
+    ax[1].grid(True)
+    plt.savefig('temp change 50 m 4_1.tiff', format='tiff')
+    plt.tight_layout()
+    plt.show()
+
+    # -------------------------
+    # Save results
+    # -------------------------
+    df = pd.DataFrame({
+        'hour': hours,
+        'Q_tot_W': Q_tot,
+        'T_b_degC': T_b,
+        'T_f_in_degC': T_f_in,
+        'T_f_out_degC': T_f_out
+    })
+    df.to_csv("ac_2p5ton_seriesBoreholes_final.csv", index=False)
+    print("Saved: ac_2p5ton_seriesBoreholes.csv")
+    
+
+if __name__ == "__main__":
+    main()
