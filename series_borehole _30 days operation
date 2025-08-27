@@ -1,5 +1,7 @@
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
 import numpy as np
 import pygfunction as gt
 import pandas as pd
@@ -55,7 +57,7 @@ def main():
     # Simulation parameters
     # -------------------------
     dt   = 3600.0          # 1 hr
-    tmax = 30*24 * 3600.0     # simulate 30 days
+    tmax = 30*24 * 3600.0     # simulate 2 days
     Nt   = int(np.ceil(tmax / dt))
     time = dt * np.arange(1, Nt+1)
     hours = time/3600
@@ -133,6 +135,19 @@ def main():
             T_f_in[i], T_b[i], m_flow_network, cp_f, nSegments=3
         )
 
+
+
+# --- Global font: Times New Roman, 12 pt everywhere ---
+    mpl.rcParams.update({
+    "font.family": "Times New Roman",
+    "font.size": 12,
+    "axes.titlesize": 12,
+    "axes.labelsize": 12,
+    "xtick.labelsize": 12,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 12,
+    "mathtext.fontset": "stix",   # math in a Times-like style
+     })
     # -------------------------
     # Plots
     # -------------------------
@@ -149,10 +164,10 @@ def main():
     ax[1].set_ylabel("Temperature [°C]")
     ax[1].legend()
     ax[1].grid(True)
-    plt.savefig('temp change 50 m 4_1.tiff', format='tiff')
+    #plt.savefig('temp change 50 m 4_1.tiff', format='tiff')
     plt.tight_layout()
     plt.show()
-
+    plt.savefig('temp vs time .tiff', format='tiff')
     # -------------------------
     # Save results
     # -------------------------
@@ -169,3 +184,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+   
+   
+   
