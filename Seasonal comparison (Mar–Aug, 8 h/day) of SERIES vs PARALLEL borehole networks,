@@ -1,0 +1,219 @@
+# -*- coding: utf-8 -*-
+"""
+Seasonal comparison (Mar–Aug, 8 h/day) of SERIES vs PARALLEL borehole networks,
+plus a length sweep to find minimum depth (parallel) meeting an EWT cap.
+
+Requires: pygfunction >= 2.3.x
+"""
+
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import datetime as dt
+import calendar
+import pygfunction as gt
+
+# -----------------------------
+# Plot style (Times New Roman)
+# -----------------------------
+mpl.rcParams['font.family'] = 'Times New Roman'
+mpl.rcParams['font.size'] = 12
+
+# -----------------------------
+# User inputs
+# -----------------------------
+TON = 2.5                       # cooling tonnage
+EWT_CAP_C = 33.0                # choose 33 or 35 per your criterion
+START_HOUR = 10                 # daily ON start (10:00)
+HOURS_ON = 8                    # ON duration per day
+MONTHS_ON = range(3, 9)         # Mar..Aug inclusive
+YEARS = 1                       # simulate one seasonal year (extend if needed)
+
+# Borefield layout (same for both topologies)
+N_1, N_2 = 4, 1                 # 4 bores in a row
+B = 7.5                         # spacing [m]
+D = 4.0                         # burial depth [m]
+H_DEFAULT = 50.0                # depth used for the series vs parallel time-series plot (m)
+r_b = 0.1532/2                  # bore radius [m]
+
+# Ground / materials
+T_g = 25.0                      # undisturbed ground [°C]
+k_s = 2.45                      # ground conductivity [W/m.K]
+alpha = 1.0e-6                  # diffusivity [m^2/s]
+k_g = 2.98                      # grout [W/m.K]
+k_p = 0.70                      # pipe [W/m.K]
+
+# Pipe / fluid
+r_out = 33.6e-3/2
+r_in  = 27.4e-3/2
+D_s   = 0.11/2                  # legs at ±D_s → spacing ≈ 0.11 m
+epsilon = 1e-6
+pos_pipes = [(-D_s, 0.0), (D_s, 0.0)]     # single U per bore
+m_flow_bore = 0.30              # kg/s per bore
+fluid = gt.media.Fluid('Water', 30.0)
+cp_f, rho_f, mu_f, k_f = fluid.cp, fluid.rho, fluid.mu, fluid.k
+
+# Time grid
+dt_sec = 3600.0                 # 1-hour step
+year0 = 2025                    # calendar for timestamping
+
+# g-function options
+OPT_SERIES   = {'nSegments': 8, 'disp': True,  'method': 'similarities'}
+OPT_PARALLEL = {'nSegments': 8, 'disp': True,  'method': 'equivalent'}  # faster for parallel
+
+# Load magnitude (cooling → inject to ground)
+Q_ON = -1000.0 * 3.517 * TON    # W
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def build_year_schedule(year, months_on, start_hour, on_hours):
+    """Hourly load vector for one calendar year. Negative = inject (cooling)."""
+    hours = (366 if calendar.isleap(year) else 365) * 24
+    Q = np.zeros(hours)
+    t0 = dt.datetime(year, 1, 1)
+    for m in months_on:
+        days = calendar.monthrange(year, m)[1]
+        for d in range(1, days+1):
+            for h in range(start_hour, start_hour + on_hours):
+                hh = h % 24
+                idx = int(((dt.datetime(year, m, d, hh) - t0).total_seconds()) // 3600)
+                Q[idx] = Q_ON
+    return Q
+
+def make_borefield(H):
+    return gt.boreholes.rectangle_field(N_1, N_2, B, B, H, D, r_b)
+
+def make_network(borefield, topology):
+    """topology ∈ {'series','parallel'}; returns (network, m_flow_network, H_tot, conn)"""
+    nB = len(borefield)
+    UTubes = []
+    for bh in borefield:
+        UTubes.append(gt.pipes.SingleUTube(pos_pipes, r_in, r_out, bh, k_s, k_g,
+                                           gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+                                           + 1.0 / (gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+                                                m_flow_bore, r_in, mu_f, rho_f, k_f, cp_f, epsilon) * 2*np.pi*r_in)))
+    if topology == 'series':
+        conn = [i-1 for i in range(nB)]   # 0←1←2←3 (flow through all in series)
+        m_flow_net = m_flow_bore          # same mass flow through all
+        opts = OPT_SERIES
+    else:
+        conn = [-1]*nB                    # all bores fed in parallel
+        m_flow_net = m_flow_bore * nB     # sum of branch flows
+        opts = OPT_PARALLEL
+
+    net = gt.networks.Network(borefield, UTubes, bore_connectivity=conn)
+    return net, m_flow_net, sum(b.H for b in borefield), opts
+
+def simulate(topology, H, Q_series):
+    """Return time-series: (time_sec, T_b, T_in, T_out)."""
+    borefield = make_borefield(H)
+    network, m_flow_net, H_tot, gopts = make_network(borefield, topology)
+    Nt = len(Q_series)
+    time = dt_sec * (np.arange(Nt) + 1)
+    LoadAgg = gt.load_aggregation.ClaessonJaved(dt_sec, time[-1])
+
+    # Network g-function (MIFT)
+    gFunc = gt.gfunction.gFunction(network, alpha,
+                                   time=LoadAgg.get_times_for_simulation(),
+                                   m_flow_network=m_flow_net, cp_f=cp_f,
+                                   boundary_condition='MIFT', options=gopts)
+    LoadAgg.initialize(gFunc.gFunc / (2*np.pi*k_s))
+
+    T_b     = np.zeros(Nt)
+    T_in    = np.zeros(Nt)   # LWT to ground
+    T_out   = np.zeros(Nt)   # EWT to unit
+
+    for i, (t, Q) in enumerate(zip(time, Q_series)):
+        LoadAgg.next_time_step(t)
+        LoadAgg.set_current_load(Q / H_tot)        # linear W/m per bore
+        dT_b = LoadAgg.temporal_superposition()
+        T_b[i] = T_g - dT_b
+        T_in[i]  = network.get_network_inlet_temperature(Q,   T_b[i], m_flow_net, cp_f, nSegments=3)
+        T_out[i] = network.get_network_outlet_temperature(T_in[i], T_b[i], m_flow_net, cp_f, nSegments=3)
+    return time, T_b, T_in, T_out
+
+def ewt_peak(topology, H, Q_series):
+    _, _, _, T_out = simulate(topology, H, Q_series)
+    return float(np.max(T_out))
+
+# -----------------------------
+# Build seasonal series
+# -----------------------------
+Q_year = build_year_schedule(year0, MONTHS_ON, START_HOUR, HOURS_ON)
+Q_series = np.tile(Q_year, YEARS)
+Nt = len(Q_series)
+time = dt_sec * (np.arange(Nt) + 1)
+
+print(f"[Schedule] ON hours/year = {np.count_nonzero(Q_year)} h   (Mar–Aug, {HOURS_ON} h/day)")
+# -----------------------------
+# -----------------------------
+# 1) Series vs Parallel (time-series) at H_DEFAULT — CLEAR, SEPARATE PLOTS
+# -----------------------------
+t_s, Tb_s, Tin_s, Tout_s = simulate('series',   H_DEFAULT, Q_series)
+t_p, Tb_p, Tin_p, Tout_p = simulate('parallel', H_DEFAULT, Q_series)
+
+# First seasonal window (Mar–Aug of first year)
+first_on = np.argmax(Q_year != 0)
+last_on  = len(Q_year) - 1 - np.argmax(Q_year[::-1] != 0)
+sl = slice(first_on, last_on + 1)
+hrs = (np.arange(sl.start, sl.stop) - sl.start)  # hours from season start
+
+# Use the same y-limits on both plots so the comparison is fair
+ymin = min(Tb_s[sl].min(), Tb_p[sl].min(), Tout_s[sl].min(), Tout_p[sl].min()) - 0.3
+ymax = max(Tb_s[sl].max(), Tb_p[sl].max(), Tout_s[sl].max(), Tout_p[sl].max()) + 0.3
+
+# --- FIGURE 1: SERIES ONLY ---
+fig1, ax1 = plt.subplots(1, 1, figsize=(10, 5))
+ax1.plot(hrs, Tout_s[sl], lw=1.8, label="EWT to unit (series)")
+ax1.plot(hrs, Tb_s[sl],  '--', lw=1.5, label="Borehole wall T_b (series)")
+ax1.axhline(EWT_CAP_C, color='k', lw=1, ls='--', label=f"EWT cap {EWT_CAP_C:.0f} °C")
+ax1.set_ylim(ymin, ymax)
+ax1.set_xlabel("Time since season start [h]")
+ax1.set_ylabel("Temperature [°C]")
+ax1.grid(True); ax1.legend(loc='best')
+plt.tight_layout()
+plt.savefig("season_series.tiff", dpi=300, bbox_inches="tight")
+
+# --- FIGURE 2: PARALLEL ONLY ---
+fig2, ax2 = plt.subplots(1, 1, figsize=(10, 5))
+ax2.plot(hrs, Tout_p[sl], lw=1.8, label="EWT to unit (parallel)")
+ax2.plot(hrs, Tb_p[sl],  '--', lw=1.5, label="Borehole wall T_b (parallel)")
+ax2.axhline(EWT_CAP_C, color='k', lw=1, ls='--', label=f"EWT cap {EWT_CAP_C:.0f} °C")
+ax2.set_ylim(ymin, ymax)   # same y-range as series plot
+ax2.set_xlabel("Time since season start [h]")
+ax2.set_ylabel("Temperature [°C]")
+ax2.grid(True); ax2.legend(loc='best')
+plt.tight_layout()
+plt.savefig("season_parallel.tiff", dpi=300, bbox_inches="tight")
+
+plt.show()
+
+# (Optional) quick text summary of peaks
+print(f"Series:   peak EWT={np.max(Tout_s):.2f} °C, peak LWT={np.max(Tin_s):.2f} °C, peak T_b={np.max(Tb_s):.2f} °C")
+print(f"Parallel: peak EWT={np.max(Tout_p):.2f} °C, peak LWT={np.max(Tin_p):.2f} °C, peak T_b={np.max(Tb_p):.2f} °C")
+
+
+# -----------------------------
+# 2) Length sweep for PARALLEL to meet EWT cap
+# -----------------------------
+H_grid = np.arange(30.0, 150.0 + 1e-9, 5.0)  # 30 m .. 150 m in 5 m steps
+peaks = np.array([ewt_peak('parallel', H, Q_series) for H in H_grid])
+feasible = peaks <= EWT_CAP_C + 1e-9
+H_min = H_grid[feasible][0] if np.any(feasible) else None
+
+fig2, ax2 = plt.subplots(1, 1, figsize=(8, 5))
+ax2.plot(H_grid, peaks, marker='o', label="Peak EWT (parallel)")
+ax2.axhline(EWT_CAP_C, color='k', lw=1, ls='--', label=f"EWT cap {EWT_CAP_C:.0f} °C")
+if H_min is not None:
+    ax2.axvline(H_min, color='C1', lw=1, ls=':', label=f"Min depth ≈ {H_min:.1f} m")
+ax2.set_xlabel("Borehole depth per bore [m]")
+ax2.set_ylabel("Seasonal peak EWT [°C]")
+ax2.grid(True); ax2.legend(); plt.tight_layout()
+plt.show()
+plt.savefig('Borehole depth per bore vs Seasonal peak EWT [°C] .tiff', format='tiff')
+if H_min is None:
+    print("Result: No depth ≤ 150 m met the EWT cap. Increase H_grid or relax the cap.")
+else:
+    print(f"Result: Minimum parallel depth meeting EWT cap {EWT_CAP_C:.0f} °C ≈ {H_min:.1f} m "
+          f"(at TON={TON:.2f}, {HOURS_ON} h/day, Mar–Aug).")
