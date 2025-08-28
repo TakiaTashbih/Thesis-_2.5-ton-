@@ -1,0 +1,182 @@
+# Pump power comparison: 4-bore SERIES vs PARALLEL for a U-tube GHX
+# - Darcy–Weisbach friction + simple minor losses
+# - Equal-branch-flow and equal-total-flow fairness modes
+# - SI units
+
+import numpy as np
+import math
+
+g = 9.80665  # m/s^2
+
+# ------------------------------
+# User inputs (edit as needed)
+# ------------------------------
+# Bore geometry
+N_bores = 4
+H       = 40.0       # depth per bore [m]
+B       = 7.5        # bore spacing [m]
+
+# Pipe hydraulics
+rho  = 995.0         # kg/m^3 (water ~30°C)
+mu   = 0.0008        # Pa·s (water ~30°C)
+eps  = 1e-6          # pipe roughness [m]
+D_leg = 0.0274       # INNER diameter of each U-tube leg [m]  (27.4 mm)
+D_hdr = 0.050        # INNER diameter of supply/return headers [m] (adjust!)
+
+# Flow choices
+m_branch_base = 0.30 # kg/s per bore (branch flow baseline)
+equal_total_flow = 4 * m_branch_base  # kg/s (for the equal-total-flow case)
+
+# Header/lateral layout (edit to match your site)
+L_hdr_supply  = (N_bores - 1) * B + 10.0   # [m] main supply header length
+L_hdr_return  = (N_bores - 1) * B + 10.0   # [m] main return header length
+L_branch_conn = 5.0                        # [m] lateral from header to each bore (each side)
+
+# Minor-loss coefficients (typical values; adjust if you have takeoff data)
+K_ubend       = 1.5    # 180° U-bend at bore bottom
+K_per_elbow   = 0.3    # long-radius 90° elbow
+n_elbows_branch = 2    # per branch (e.g., at top entry/exit)
+K_tee_branch  = 1.0    # tee (branch) loss coefficient per connection
+K_tee_run     = 0.2    # tee (run) loss coefficient (average)
+
+pump_efficiency = 0.6  # overall wire-to-water efficiency (0.5–0.7 common)
+
+# ------------------------------
+# Helpers
+# ------------------------------
+def area(D):
+    return math.pi * (D**2) / 4.0
+
+def velocity(m_dot, rho, D):
+    return m_dot / (rho * area(D))
+
+def reynolds(rho, v, D, mu):
+    return rho * v * D / mu
+
+def friction_factor(Re, D, eps):
+    # Haaland explicit correlation (works for laminar/turbulent)
+    if Re < 2000:
+        return 64.0 / max(Re, 1e-9)
+    term = (eps/D)/3.7
+    return 1.0 / ( -1.8 * math.log10( (term**1.11) + (6.9/Re) ) )**2
+
+def dp_friction(rho, v, L, D, f):
+    return f * (L/D) * 0.5 * rho * v**2  # Pa
+
+def dp_minor(rho, v, Ksum):
+    return Ksum * 0.5 * rho * v**2       # Pa
+
+def head_from_dp(dp, rho):
+    return dp / (rho * g)                # m
+
+def pump_power_W(Q_vol, dp_total, eta):
+    return (Q_vol * dp_total) / max(eta, 1e-9)  # W
+
+# Re-usable: report a single straight run
+def straight_run_dp(rho, mu, m_dot, D, L, eps):
+    v  = velocity(m_dot, rho, D)
+    Re = reynolds(rho, v, D, mu)
+    f  = friction_factor(Re, D, eps)
+    dp = dp_friction(rho, v, L, D, f)
+    return dp, v, Re, f
+
+# ------------------------------
+# SERIES topology (flow through all bores in sequence)
+# ------------------------------
+def hydraulics_series(m_branch):
+    # Total network flow equals branch flow in series
+    m_total = m_branch
+    Q_total = m_total / rho
+
+    # Vertical legs: total length = 2H per bore * N_bores (same flow through all)
+    L_vert_total = 2.0 * H * N_bores
+    dp_vert, v_leg, Re_leg, f_leg = straight_run_dp(rho, mu, m_total, D_leg, L_vert_total, eps)
+
+    # U-bends: one per bore, same flow
+    v_leg_local = v_leg
+    dp_ubends = dp_minor(rho, v_leg_local, K_ubend * N_bores)
+
+    # Headers (series path connections) — assume full flow through these runs
+    L_hdr_total = L_hdr_supply + L_hdr_return
+    dp_hdr, v_hdr, Re_hdr, f_hdr = straight_run_dp(rho, mu, m_total, D_hdr, L_hdr_total, eps)
+
+    # Elbows along the way (estimate)
+    K_elbows = n_elbows_branch * N_bores * K_per_elbow
+    dp_elbows = dp_minor(rho, v_leg_local, K_elbows)
+
+    dp_total = dp_vert + dp_ubends + dp_hdr + dp_elbows
+    head_total = head_from_dp(dp_total, rho)
+    P = pump_power_W(Q_total, dp_total, pump_efficiency)
+
+    return {
+        "m_total": m_total, "Q_total": Q_total,
+        "v_leg": v_leg, "Re_leg": Re_leg, "f_leg": f_leg,
+        "v_hdr": v_hdr, "Re_hdr": Re_hdr, "f_hdr": f_hdr,
+        "dp_total_Pa": dp_total, "head_m": head_total, "P_pump_W": P
+    }
+
+# ------------------------------
+# PARALLEL topology (flow splits into N_bores branches)
+# ------------------------------
+def hydraulics_parallel(m_branch):
+    m_total = m_branch * N_bores
+    Q_total = m_total / rho
+
+    # Branch (per bore): vertical legs
+    L_vert_branch = 2.0 * H
+    dp_vert_b, v_leg_b, Re_leg_b, f_leg_b = straight_run_dp(rho, mu, m_branch, D_leg, L_vert_branch, eps)
+
+    # Branch minor losses: U-bend + elbows + tee (branch) on each branch
+    K_minor_branch = K_ubend + n_elbows_branch * K_per_elbow + K_tee_branch
+    dp_minor_b = dp_minor(rho, v_leg_b, K_minor_branch)
+
+    # Each branch also has lateral connection length
+    dp_lat_b, v_lat_b, Re_lat_b, f_lat_b = straight_run_dp(rho, mu, m_branch, D_hdr, L_branch_conn*2.0, eps)
+
+    # Header friction: flow varies along header; approximate with average flow = 0.5 * m_total
+    m_hdr_avg = 0.5 * m_total
+    L_hdr_total = L_hdr_supply + L_hdr_return
+    dp_hdr, v_hdr, Re_hdr, f_hdr = straight_run_dp(rho, mu, m_hdr_avg, D_hdr, L_hdr_total, eps)
+
+    # Header tee losses (on run); approximate small K per branch on supply+return
+    K_hdr_run_total = N_bores * 2 * K_tee_run
+    # Use average header velocity for minor run losses
+    dp_hdr_minor = dp_minor(rho, v_hdr, K_hdr_run_total)
+
+    # Combine: total ΔP is the max branch ΔP + shared header ΔP
+    dp_branch_total = dp_vert_b + dp_minor_b + dp_lat_b
+    dp_total = dp_branch_total + dp_hdr + dp_hdr_minor
+    head_total = head_from_dp(dp_total, rho)
+    P = pump_power_W(Q_total, dp_total, pump_efficiency)
+
+    return {
+        "m_total": m_total, "Q_total": Q_total,
+        "v_leg": v_leg_b, "Re_leg": Re_leg_b, "f_leg": f_leg_b,
+        "v_hdr": v_hdr, "Re_hdr": Re_hdr, "f_hdr": f_hdr,
+        "dp_total_Pa": dp_total, "head_m": head_total, "P_pump_W": P
+    }
+
+# ------------------------------
+# Run comparisons
+# ------------------------------
+def pretty(label, r):
+    print(f"\n[{label}]")
+    print(f"  Total mass flow     : {r['m_total']:.3f} kg/s")
+    print(f"  Header velocity     : {r['v_hdr']:.2f} m/s (Re={r['Re_hdr']:.0f}, f={r['f_hdr']:.4f})")
+    print(f"  Leg velocity        : {r['v_leg']:.2f} m/s (Re={r['Re_leg']:.0f}, f={r['f_leg']:.4f})")
+    print(f"  Total head          : {r['head_m']:.2f} m")
+    print(f"  Pump power (η={pump_efficiency:.2f}) : {r['P_pump_W']:.0f} W")
+
+# Case A: Equal branch flow (0.30 kg/s per bore)
+res_ser_eqBranch = hydraulics_series(m_branch_base)
+res_par_eqBranch = hydraulics_parallel(m_branch_base)
+pretty("SERIES  — equal branch flow (0.30 kg/s per bore)", res_ser_eqBranch)
+pretty("PARALLEL— equal branch flow (0.30 kg/s per bore)", res_par_eqBranch)
+
+# Case B: Equal TOTAL flow (4 * 0.30 = 1.20 kg/s)
+# - Series branch flow = total
+# - Parallel branch flow = total / N_bores
+res_ser_eqTotal = hydraulics_series(equal_total_flow)
+res_par_eqTotal = hydraulics_parallel(equal_total_flow / N_bores)
+pretty("SERIES  — equal TOTAL flow (1.20 kg/s)", res_ser_eqTotal)
+pretty("PARALLEL— equal TOTAL flow (1.20 kg/s)", res_par_eqTotal)
