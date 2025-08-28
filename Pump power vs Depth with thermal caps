@@ -1,0 +1,296 @@
+# -*- coding: utf-8 -*-
+"""
+Pump power vs Depth with thermal caps (10th-year Mar–Oct)
+- Thermal caps: Peak EWT <= 35 °C and Peak Mean Fluid Temperature <= 40 °C
+- Four cases: (Series/Parallel) × (Equal branch flow / Equal total flow)
+- Full 10-year simulation (2025..2034); peaks computed over 2034 season
+- Clean Times New Roman plots; TIFF saves
+
+Requires: pygfunction >= 2.3.x
+"""
+
+import numpy as np
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import calendar, datetime as dt
+import math
+import pygfunction as gt
+
+# ---------------- Figure style ----------------
+mpl.rcParams.update({
+    "font.family": "Times New Roman",
+    "font.size": 12,
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+})
+
+# ============================ User choices ============================
+TON          = 2.5                   # cooling tonnage
+EWT_CAP_C    = 35.0                  # EWT cap [°C]
+TM_CAP_C     = 40.0                  # mean fluid temperature cap [°C]
+START_HOUR   = 10                    # ON start (10:00)
+HOURS_ON     = 8                     # ON duration per day
+MONTHS_ON    = range(3, 11)          # Mar..Oct inclusive
+YEARS        = 10                    # 2025..2034
+YEAR0        = 2025
+H_GRID       = np.arange(30.0, 150.0 + 1e-9, 5.0)  # depth sweep [m]
+
+# Borefield layout
+N1, N2 = 4, 1                        # 4 bores in a row
+N_BORES = N1 * N2
+B      = 7.5                         # spacing [m]
+D      = 4.0                         # burial depth [m]
+r_b    = 0.1532/2                    # bore radius [m]
+
+# Ground / materials
+T_g, k_s, alpha = 25.0, 2.45, 1.0e-6
+k_g, k_p = 2.98, 0.70
+
+# Pipe / fluid
+r_out, r_in = 33.6e-3/2, 27.4e-3/2
+D_s = 0.11/2
+epsilon = 1e-6
+pos = [(-D_s, 0.0), (D_s, 0.0)]
+m_flow_bore_base = 0.30              # branch mass flow per bore [kg/s]
+fluid = gt.media.Fluid('Water', 30.0)
+cp_f, rho_f, mu_f, k_f = fluid.cp, fluid.rho, fluid.mu, fluid.k
+
+# Time grid (hourly)
+dt_sec = 3600.0
+
+# g-function options
+OPTS_SERIES   = {'nSegments': 8, 'disp': False}
+OPTS_PARALLEL = {'nSegments': 8, 'disp': False}
+
+# ---------------- Hydraulics (Darcy–Weisbach) ----------------
+g = 9.80665  # m/s^2
+
+# Pipe sizes & lengths (adjust to your manifold/layout)
+D_leg = 0.0274          # inner diameter U-tube leg [m]
+D_hdr = 0.050           # inner diameter headers [m]
+L_hdr_supply  = (N_BORES - 1)*B + 10.0   # [m]
+L_hdr_return  = (N_BORES - 1)*B + 10.0   # [m]
+L_branch_conn = 5.0                      # [m] per branch (each side)
+
+# Minor loss coefficients (edit if you have takeoff data)
+K_ubend         = 1.5
+K_per_elbow     = 0.30
+n_elbows_branch = 2
+K_tee_branch    = 1.0
+K_tee_run       = 0.20
+pump_efficiency = 0.60
+
+def area(D): return math.pi*(D**2)/4.0
+def velocity(m_dot, rho, D): return m_dot/(rho*area(D))
+def reynolds(rho, v, D, mu): return rho*v*D/mu
+def friction_factor(Re, D, eps):
+    if Re < 2000: return 64.0/max(Re,1e-9)
+    term = (eps/D)/3.7
+    return 1.0/(-1.8*math.log10((term**1.11)+(6.9/Re)))**2
+def dp_fric(rho, v, L, D, f): return f*(L/D)*0.5*rho*v**2
+def dp_minor(rho, v, K): return K*0.5*rho*v**2
+def head_from_dp(dp, rho): return dp/(rho*g)
+def pump_power_W(Q_vol, dp, eta): return (Q_vol*dp)/max(eta,1e-9)
+def straight_run_dp(rho, mu, m_dot, D, L, eps):
+    v  = velocity(m_dot, rho, D); Re = reynolds(rho, v, D, mu); f  = friction_factor(Re, D, eps)
+    dp = dp_fric(rho, v, L, D, f); return dp, v, Re, f
+
+def hydraulics_series(H, m_branch):
+    m_total = m_branch; Q_total = m_total / rho
+    L_vert_total = 2.0 * H * N_BORES
+    dp_vert, v_leg, Re_leg, f_leg = straight_run_dp(rho, mu_f, m_total, D_leg, L_vert_total, epsilon)
+    dp_ub   = dp_minor(rho, v_leg, K_ubend*N_BORES)
+    L_hdr_total = L_hdr_supply + L_hdr_return
+    dp_hdr, v_hdr, Re_hdr, f_hdr = straight_run_dp(rho, mu_f, m_total, D_hdr, L_hdr_total, epsilon)
+    dp_el   = dp_minor(rho, v_leg, n_elbows_branch*N_BORES*K_per_elbow)
+    dp_tot  = dp_vert + dp_ub + dp_hdr + dp_el
+    return dp_tot, head_from_dp(dp_tot, rho), pump_power_W(Q_total, dp_tot, pump_efficiency)
+
+def hydraulics_parallel(H, m_branch):
+    m_total = m_branch * N_BORES; Q_total = m_total / rho
+    L_vert_b = 2.0 * H
+    dp_legs_b, v_leg_b, Re_leg_b, f_leg_b = straight_run_dp(rho, mu_f, m_branch, D_leg, L_vert_b, epsilon)
+    dp_minor_b = dp_minor(rho, v_leg_b, K_ubend + n_elbows_branch*K_per_elbow + K_tee_branch)
+    dp_lat_b, v_lat_b, Re_lat_b, f_lat_b = straight_run_dp(rho, mu_f, m_branch, D_hdr, 2.0*L_branch_conn, epsilon)
+    m_hdr_avg = 0.5 * m_total
+    L_hdr_total = L_hdr_supply + L_hdr_return
+    dp_hdr, v_hdr, Re_hdr, f_hdr = straight_run_dp(rho, mu_f, m_hdr_avg, D_hdr, L_hdr_total, epsilon)
+    dp_hdr_minor = dp_minor(rho, v_hdr, 2*N_BORES*K_tee_run)
+    dp_branch = dp_legs_b + dp_minor_b + dp_lat_b
+    dp_tot = dp_branch + dp_hdr + dp_hdr_minor
+    return dp_tot, head_from_dp(dp_tot, rho), pump_power_W(Q_total, dp_tot, pump_efficiency)
+
+# ============================== Thermal helpers ===============================
+def build_year_schedule(year, months_on, start_hour, on_hours, Q_on):
+    hours = (366 if calendar.isleap(year) else 365) * 24
+    Q = np.zeros(hours); t0 = dt.datetime(year, 1, 1)
+    for m in months_on:
+        days = calendar.monthrange(year, m)[1]
+        for d in range(1, days + 1):
+            for h in range(start_hour, start_hour + on_hours):
+                hh = h % 24
+                idx = int((dt.datetime(year, m, d, hh) - t0).total_seconds() // 3600)
+                if 0 <= idx < hours: Q[idx] = Q_on
+    return Q
+
+def build_multi_year_schedule(year0, years, months_on, start_hour, on_hours, Q_on):
+    Q_years = []; year_offsets = [0]
+    for i in range(years):
+        y = year0 + i; Qy = build_year_schedule(y, months_on, start_hour, on_hours, Q_on)
+        Q_years.append(Qy); year_offsets.append(year_offsets[-1] + Qy.size)
+    return np.concatenate(Q_years), np.array(year_offsets[:-1])
+
+def season_slice_for_year(index0, Q_series, year_offsets):
+    y0 = year_offsets[index0]
+    y1 = year_offsets[index0+1] if index0+1 < len(year_offsets) else Q_series.size
+    Qy = Q_series[y0:y1]
+    if not np.any(Qy): return slice(y0,y0)
+    start = y0 + np.argmax(Qy != 0); stop = y1 - np.argmax(Qy[::-1] != 0)
+    return slice(start, stop)
+
+def pipe_resistance(m_flow_branch):
+    R_p = gt.pipes.conduction_thermal_resistance_circular_pipe(r_in, r_out, k_p)
+    h_f = gt.pipes.convective_heat_transfer_coefficient_circular_pipe(
+        m_flow_branch, r_in, mu_f, rho_f, k_f, cp_f, epsilon
+    )
+    R_f = 1.0 / (h_f * 2 * np.pi * r_in)
+    return R_p + R_f
+
+def make_network(H, topology, m_flow_branch):
+    borefield = gt.boreholes.rectangle_field(N1, N2, B, B, H, D, r_b)
+    nB = len(borefield)
+    Rtube = pipe_resistance(m_flow_branch)
+    UTubes = [gt.pipes.SingleUTube(pos, r_in, r_out, bh, k_s, k_g, Rtube) for bh in borefield]
+    if topology == 'series':
+        conn = [i-1 for i in range(nB)]; m_flow_network = m_flow_branch
+    else:
+        conn = [-1]*nB; m_flow_network = m_flow_branch * nB
+    net = gt.networks.Network(borefield, UTubes, bore_connectivity=conn)
+    H_tot = sum(b.H for b in borefield)
+    return net, m_flow_network, H_tot
+
+def simulate(topology, H, Q_series, m_flow_branch):
+    net, m_flow_net, H_tot = make_network(H, topology, m_flow_branch)
+    Nt = len(Q_series); time = dt_sec * (np.arange(Nt) + 1)
+    LoadAgg = gt.load_aggregation.ClaessonJaved(dt_sec, time[-1])
+    gFunc = gt.gfunction.gFunction(
+        net, alpha, time=LoadAgg.get_times_for_simulation(),
+        m_flow_network=m_flow_net, cp_f=cp_f,
+        boundary_condition='MIFT',
+        options=(OPTS_SERIES if topology=='series' else OPTS_PARALLEL),
+        method='equivalent'
+    )
+    LoadAgg.initialize(gFunc.gFunc / (2 * np.pi * k_s))
+    T_b = np.zeros(Nt); T_in = np.zeros(Nt); T_out = np.zeros(Nt)
+    for i, (t, Q) in enumerate(zip(time, Q_series)):
+        LoadAgg.next_time_step(t); LoadAgg.set_current_load(Q / H_tot)
+        Tb = T_g - LoadAgg.temporal_superposition(); T_b[i] = Tb
+        Tin  = net.get_network_inlet_temperature(Q, Tb, m_flow_net, cp_f, nSegments=3); T_in[i] = Tin
+        T_out[i] = net.get_network_outlet_temperature(Tin, Tb, m_flow_net, cp_f, nSegments=3)
+    return T_out, T_in, T_b
+
+def sweep_peaks_and_pump(topology, H_grid, Q_full, m_flow_branch, sl_season):
+    """Return arrays (peak_EWT, peak_MFT, pump_W) for each depth."""
+    peak_EWT = np.empty_like(H_grid, dtype=float)
+    peak_MFT = np.empty_like(H_grid, dtype=float)
+    pump_W   = np.empty_like(H_grid, dtype=float)
+    for i, H in enumerate(H_grid):
+        print(f"[{topology}] H = {H:.1f} m ({i+1}/{len(H_grid)})")
+        Tout, Tin, _ = simulate(topology, H, Q_full, m_flow_branch)
+        EWT = Tout[sl_season]; MFT = 0.5*(Tin[sl_season] + Tout[sl_season])
+        peak_EWT[i] = np.nanmax(EWT); peak_MFT[i] = np.nanmax(MFT)
+        if topology == 'series':
+            dp, _, P = hydraulics_series(H, m_flow_branch)
+        else:
+            dp, _, P = hydraulics_parallel(H, m_flow_branch)
+        pump_W[i] = P
+    return peak_EWT, peak_MFT, pump_W
+
+def min_depth_at_cap(H, P, cap):
+    mask = np.isfinite(P); Hf, Pf = H[mask], P[mask]
+    if Hf.size==0 or not np.any(Pf <= cap): return None, None, False
+    i = np.argmax(Pf <= cap); H_disc = float(Hf[i])
+    if i==0: return H_disc, H_disc, True
+    H1,H2 = Hf[i-1],Hf[i]; P1,P2 = Pf[i-1],Pf[i]
+    H_star = H1 + (cap - P1)*(H2-H1)/((P2-P1) if not np.isclose(P2,P1) else 1.0)
+    return float(H_star), H_disc, True
+
+def joint_min_depth(H, peaks_EWT, peaks_MFT, cap_EWT, cap_MFT):
+    H_e, Hg_e, ok_e = min_depth_at_cap(H, peaks_EWT, cap_EWT)
+    H_m, Hg_m, ok_m = min_depth_at_cap(H, peaks_MFT, cap_MFT)
+    if not (ok_e and ok_m): return None, None, ("EWT" if not ok_e else "MFT"), False
+    H_req = max(H_e, H_m); H_req_grid = max(Hg_e, Hg_m)
+    ctrl = "EWT" if H_e >= H_m else "MFT"
+    if np.isclose(H_e, H_m): ctrl = "both"
+    return H_req, H_req_grid, ctrl, True
+
+# ========================== Build schedule & slice 10th year =========================
+Q_on = -1000.0 * 3.517 * TON  # W (cooling injects heat → negative)
+Q_series, year_offsets = build_multi_year_schedule(
+    YEAR0, YEARS, MONTHS_ON, START_HOUR, HOURS_ON, Q_on
+)
+sl_2034 = season_slice_for_year(9, Q_series, year_offsets)
+print(f"[Schedule] Using 2034 season (Mar–Oct, 8 h/day) for peaks.")
+
+# ============================ Run sweeps (4 cases) ============================
+# Equal BRANCH flow (same branch kg/s both topologies)
+S_E_b, S_M_b, S_P_b = sweep_peaks_and_pump('series',   H_GRID, Q_series, m_flow_bore_base, sl_2034)
+P_E_b, P_M_b, P_P_b = sweep_peaks_and_pump('parallel', H_GRID, Q_series, m_flow_bore_base, sl_2034)
+
+# Equal TOTAL flow (series branch = total; parallel branch = total/N)
+m_total_eq = N_BORES * m_flow_bore_base
+S_E_t, S_M_t, S_P_t = sweep_peaks_and_pump('series',   H_GRID, Q_series, m_total_eq,           sl_2034)
+P_E_t, P_M_t, P_P_t = sweep_peaks_and_pump('parallel', H_GRID, Q_series, m_total_eq/N_BORES,   sl_2034)
+
+# ============================== Plot helpers ==============================
+def plot_pump_vs_depth(H, P_series, P_parallel, E_series, M_series, E_parallel, M_parallel,
+                       title, fname):
+    """Plot pump power vs depth; highlight points that meet BOTH caps."""
+    pass_S = (E_series <= EWT_CAP_C) & (M_series <= TM_CAP_C)
+    pass_P = (E_parallel <= EWT_CAP_C) & (M_parallel <= TM_CAP_C)
+
+    fig, ax = plt.subplots(figsize=(8.0,5.0))
+    # Base lines (light)
+    ax.plot(H, P_series/1000.0, '-', lw=1.2, alpha=0.35, label="Series (all)")
+    ax.plot(H, P_parallel/1000.0, '-', lw=1.2, alpha=0.35, label="Parallel (all)")
+    # Highlight feasible points
+    ax.plot(H[pass_S], (P_series[pass_S]/1000.0), 'o', ms=4, label="Series (meets caps)")
+    ax.plot(H[pass_P], (P_parallel[pass_P]/1000.0), 's', ms=4, label="Parallel (meets caps)")
+
+    ax.set_xlabel("Borehole depth per bore [m]")
+    ax.set_ylabel("Pump power [kW]")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False, loc="best")
+    plt.tight_layout()
+    plt.savefig(fname, format='tiff')
+    plt.show()
+
+# ============================== Plots (2 figures) ==============================
+plot_pump_vs_depth(
+    H_GRID, S_P_b, P_P_b, S_E_b, S_M_b, P_E_b, P_M_b,
+    "Pump power vs Depth — Equal branch flow (caps: EWT≤35°C, MFT≤40°C)",
+    "Pump_vs_Depth_equal_branch.tiff"
+)
+plot_pump_vs_depth(
+    H_GRID, S_P_t, P_P_t, S_E_t, S_M_t, P_E_t, P_M_t,
+    "Pump power vs Depth — Equal total flow (caps: EWT≤35°C, MFT≤40°C)",
+    "Pump_vs_Depth_equal_total.tiff"
+)
+
+# ============================ Printed summaries ==========================
+def report_case(name, peaks_E, peaks_M, pump_W):
+    H_req, H_grid_req, ctrl, ok = joint_min_depth(H_GRID, peaks_E, peaks_M, EWT_CAP_C, TM_CAP_C)
+    if not ok:
+        print(f"{name:32s}  No depth ≤ {H_GRID[-1]:.0f} m meets {ctrl} cap.")
+        return
+    # pump at nearest grid point to H_grid_req (discrete)
+    i = int(np.argmin(np.abs(H_GRID - H_grid_req)))
+    print(f"{name:32s}  H* (both caps) ≈ {H_req:6.1f} m  (grid {H_grid_req:5.1f} m)"
+          f"  → Pump ≈ {pump_W[i]/1000.0:.2f} kW  (controlling: {ctrl})")
+
+print("\nMinimum depth & pump power meeting BOTH caps (2034 season):")
+report_case("Series — equal branch",   S_E_b, S_M_b, S_P_b)
+report_case("Parallel — equal branch", P_E_b, P_M_b, P_P_b)
+report_case("Series — equal total",    S_E_t, S_M_t, S_P_t)
+report_case("Parallel — equal total",  P_E_t, P_M_t, P_P_t)
